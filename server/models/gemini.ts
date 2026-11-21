@@ -42,6 +42,18 @@ export function getDecisionsClient(): GoogleGenAI {
   });
 }
 
+export function getAgentClient(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: requireGeminiApiKey(),
+    apiVersion: "v1beta",
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+}
+
 /**
  * Wraps PR-derived text so models treat it strictly as untrusted data, never instructions.
  */

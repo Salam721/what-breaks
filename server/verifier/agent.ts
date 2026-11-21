@@ -4,7 +4,7 @@ import {
   MODELS,
   collectInteractionText,
   extractJsonFromText,
-  getAiClient,
+  getAgentClient,
   wrapUntrusted,
 } from "../models/gemini.ts";
 import { writeEvidenceFile } from "../run/evidence.ts";
@@ -37,8 +37,36 @@ async function toBuffer(raw: unknown): Promise<Buffer> {
   return Buffer.from(String(raw));
 }
 
+async function listSandboxFiles(
+  ai: ReturnType<typeof getAgentClient>,
+  environmentId: string
+): Promise<string[]> {
+  const paths: string[] = [];
+  for (const root of ["workspace", ""]) {
+    try {
+      const res = await ai.environments.files.list({
+        environment: environmentId,
+        path: root,
+        recursive: true,
+        api_version: "v1beta",
+      });
+      if (Array.isArray(res.files)) {
+        for (const f of res.files) {
+          if (typeof f.path === "string" && f.path.length > 0) {
+            paths.push(f.path);
+          }
+        }
+      }
+      if (paths.length > 0) break;
+    } catch {
+      // Try next root
+    }
+  }
+  return Array.from(new Set(paths));
+}
+
 async function downloadSandboxFile(
-  ai: ReturnType<typeof getAiClient>,
+  ai: ReturnType<typeof getAgentClient>,
   environmentId: string,
   sandboxPath: string
 ): Promise<Buffer | null> {
@@ -46,6 +74,7 @@ async function downloadSandboxFile(
     const bytes = await ai.environments.files.download({
       environment: environmentId,
       path: sandboxPath,
+      api_version: "v1beta",
     });
     const buf = await toBuffer(bytes);
     return buf.length > 0 ? buf : null;
@@ -54,12 +83,47 @@ async function downloadSandboxFile(
   }
 }
 
+export async function downloadSandboxEvidenceFile(
+  ai: ReturnType<typeof getAgentClient>,
+  environmentId: string,
+  listedPaths: string[],
+  filename: string
+): Promise<Buffer | null> {
+  const lowerTarget = filename.toLowerCase();
+  const matchingFromList = listedPaths
+    .filter((p) => {
+      const lp = p.toLowerCase();
+      return lp.endsWith(`/evidence/${lowerTarget}`) || lp === `evidence/${lowerTarget}` || lp.endsWith(`/${lowerTarget}`) || lp === lowerTarget;
+    })
+    .sort((a, b) => {
+      const aEv = a.toLowerCase().includes("/evidence/") ? 0 : 1;
+      const bEv = b.toLowerCase().includes("/evidence/") ? 0 : 1;
+      return aEv - bEv || a.length - b.length;
+    });
+
+  const candidates = Array.from(
+    new Set([
+      ...matchingFromList,
+      `workspace/evidence/${filename}`,
+      `evidence/${filename}`,
+      `workspace/repo/evidence/${filename}`,
+      `repo/evidence/${filename}`,
+    ])
+  );
+
+  for (const candidate of candidates) {
+    const buf = await downloadSandboxFile(ai, environmentId, candidate);
+    if (buf) return buf;
+  }
+  return null;
+}
+
 export async function runVerifier(
   prediction: Scored,
   ctx: PrContext,
   opts: VerifierOptions
 ): Promise<VerifierResult> {
-  const ai = getAiClient();
+  const ai = getAgentClient();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
 
@@ -69,14 +133,15 @@ export async function runVerifier(
     "",
     "Goal: Clone the public GitHub PR branch, start the application, exercise ONE predicted user flow in a headless browser, and save evidence files.",
     "",
-    `1. Clone repository and check out the PR head:`,
-    `   git clone ${ctx.cloneUrl} repo && cd repo`,
+    `1. Clone repository and check out the PR head inside /workspace/repo:`,
+    `   mkdir -p /workspace/evidence`,
+    `   git clone ${ctx.cloneUrl} /workspace/repo && cd /workspace/repo`,
     `   git fetch origin pull/${ctx.pr.number}/head:pr-head && git checkout pr-head`,
     `   Verify commit SHA is ${ctx.pr.headSha} (or fetch ${ctx.pr.headSha} if available).`,
     "",
     "2. Inspect the project root (package.json, README, pyproject.toml, etc.) to install dependencies and start the app locally.",
     "   - If the app CANNOT be started in this sandbox (for example: 'needs a database', 'no start command found', 'missing external API credentials', 'build failed'), DO NOT fake success.",
-    "   - Write `evidence/status.json` with: {\"startedApp\": false, \"reason\": \"<short specific reason>\", \"note\": \"<details>\"} and write full stdout/stderr to `evidence/run.log`.",
+    "   - Write `/workspace/evidence/status.json` with: {\"startedApp\": false, \"reason\": \"<short specific reason>\", \"note\": \"<details>\"} and write full stdout/stderr to `/workspace/evidence/run.log`.",
     "",
     "3. If the app starts:",
     "   - Wait until the local port responds.",
@@ -84,11 +149,11 @@ export async function runVerifier(
     `   Flow ID: ${prediction.flowId}`,
     `   Predicted issue: ${wrapUntrusted(prediction.hypothesis)}`,
     `   Steps to verify: ${wrapUntrusted(prediction.howToVerify)}`,
-    "   - Capture a full-page PNG screenshot at `evidence/screenshot.png` (from the workspace root so `evidence/screenshot.png` exists).",
-    "   - Save app server logs, browser console errors, network errors, and test output to `evidence/run.log`.",
-    "   - Write `evidence/status.json` with: {\"startedApp\": true, \"note\": \"<factual summary of what occurred>\"}.",
+    "   - Capture a full-page PNG screenshot at `/workspace/evidence/screenshot.png`.",
+    "   - Save app server logs, browser console errors, network errors, and test output to `/workspace/evidence/run.log`.",
+    "   - Write `/workspace/evidence/status.json` with: {\"startedApp\": true, \"note\": \"<factual summary of what occurred>\"}.",
     "",
-    "4. Always create the `evidence/` directory in your current working directory (`/workspace/evidence` or `./evidence`) so files are downloadable at `evidence/status.json`, `evidence/run.log`, and `evidence/screenshot.png`.",
+    "4. Always confirm `/workspace/evidence/status.json`, `/workspace/evidence/run.log`, and `/workspace/evidence/screenshot.png` exist on disk before finishing.",
     "5. End your final message with JSON: {\"startedApp\": boolean, \"reason\"?: string, \"note\"?: string}.",
   ].join("\n");
 
@@ -131,9 +196,13 @@ export async function runVerifier(
     let logBuf: Buffer | null = null;
 
     if (envId) {
-      const statusBytes =
-        (await downloadSandboxFile(ai, envId, "evidence/status.json")) ??
-        (await downloadSandboxFile(ai, envId, "repo/evidence/status.json"));
+      const listedPaths = await listSandboxFiles(ai, envId);
+      const statusBytes = await downloadSandboxEvidenceFile(
+        ai,
+        envId,
+        listedPaths,
+        "status.json"
+      );
       if (statusBytes) {
         try {
           statusObj = JSON.parse(statusBytes.toString("utf8")) as SandboxStatus;
@@ -142,13 +211,19 @@ export async function runVerifier(
         }
       }
 
-      screenshotBuf =
-        (await downloadSandboxFile(ai, envId, "evidence/screenshot.png")) ??
-        (await downloadSandboxFile(ai, envId, "repo/evidence/screenshot.png"));
+      screenshotBuf = await downloadSandboxEvidenceFile(
+        ai,
+        envId,
+        listedPaths,
+        "screenshot.png"
+      );
 
-      logBuf =
-        (await downloadSandboxFile(ai, envId, "evidence/run.log")) ??
-        (await downloadSandboxFile(ai, envId, "repo/evidence/run.log"));
+      logBuf = await downloadSandboxEvidenceFile(
+        ai,
+        envId,
+        listedPaths,
+        "run.log"
+      );
     }
 
     if (statusObj.startedApp === undefined) {
