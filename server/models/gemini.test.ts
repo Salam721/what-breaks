@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { wrapUntrusted, extractJsonFromText, withRetryOnce } from "./gemini.ts";
+import {
+  wrapUntrusted,
+  extractJsonFromText,
+  withRetryOnce,
+  formatApiError,
+  isBadRequestError,
+} from "./gemini.ts";
 
 test("wrapUntrusted wraps text cleanly and neutralizes tag breakout", () => {
   assert.equal(wrapUntrusted("x"), "<untrusted_pr>x</untrusted_pr>");
@@ -27,4 +33,15 @@ test("withRetryOnce retries once and succeeds on second try", async () => {
   }, "test-op");
   assert.equal(res, "ok");
   assert.equal(calls, 2);
+});
+
+test("formatApiError surfaces SDK body instead of opaque httpMeta", () => {
+  const err = Object.assign(
+    new Error('400 API error occurred: {"httpMeta":{"response":{},"request":{}}}'),
+    { statusCode: 400, body: '{"error":{"message":"enum not supported"}}' }
+  );
+  const formatted = formatApiError(err);
+  assert.ok(formatted.includes("enum not supported"));
+  assert.equal(formatted.includes("httpMeta"), false);
+  assert.equal(isBadRequestError(err), true);
 });

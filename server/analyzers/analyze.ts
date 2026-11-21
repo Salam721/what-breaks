@@ -10,6 +10,7 @@ import {
   collectInteractionText,
   extractJsonFromText,
   getAiClient,
+  isBadRequestError,
   withRetryOnce,
   wrapUntrusted,
 } from "../models/gemini.ts";
@@ -39,7 +40,8 @@ export async function analyze(
     "Rules:",
     "- Use stable slug flow IDs (lowercase alphanumeric + hyphens, e.g. 'checkout-submit').",
     "- Each prediction must reference an existing flowId from `flows`, include a concrete `hypothesis`, `cites` with real file paths from the repository, and actionable `howToVerify` browser/app steps.",
-    "- Only output JSON matching the schema with zero extra fields.",
+    "- Return ONLY raw JSON (no markdown fences) matching this exact shape with zero extra keys:",
+    '  {"flows":[{"id":"string","name":"string","kind":"page|endpoint|table|flow","touches":["path"]}],"predictions":[{"id":"string","flowId":"string","risk":"low|medium|high","hypothesis":"string","cites":[{"file":"string","lines":"optional"}],"howToVerify":"string"}]}',
     "",
     `Repository: ${ctx.pr.owner}/${ctx.pr.repo} PR #${ctx.pr.number}`,
     `Triaged areas: ${triageResult.areas.join(", ") || "general"}`,
@@ -60,72 +62,87 @@ export async function analyze(
     wrapUntrusted(filesText),
   ].join("\n");
 
-  return withRetryOnce(async () => {
-    const interaction = await ai.interactions.create({
-      model: modelId,
-      system_instruction: `${UNTRUSTED_SYSTEM_PREAMBLE}\nReturn strictly valid JSON with only the requested fields.`,
-      input: prompt,
-      response_format: {
-        type: Type.OBJECT,
-        properties: {
-          flows: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                name: { type: Type.STRING },
-                kind: {
-                  type: Type.STRING,
-                  enum: ["page", "endpoint", "table", "flow"],
-                },
-                touches: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
-              },
-              required: ["id", "name", "kind", "touches"],
+  const responseFormat = {
+    type: Type.OBJECT,
+    properties: {
+      flows: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            name: { type: Type.STRING },
+            kind: {
+              type: Type.STRING,
+              enum: ["page", "endpoint", "table", "flow"],
+            },
+            touches: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
             },
           },
-          predictions: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                flowId: { type: Type.STRING },
-                risk: {
-                  type: Type.STRING,
-                  enum: ["low", "medium", "high"],
-                },
-                hypothesis: { type: Type.STRING },
-                cites: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      file: { type: Type.STRING },
-                      lines: { type: Type.STRING },
-                    },
-                    required: ["file"],
-                  },
-                },
-                howToVerify: { type: Type.STRING },
-              },
-              required: [
-                "id",
-                "flowId",
-                "risk",
-                "hypothesis",
-                "cites",
-                "howToVerify",
-              ],
-            },
-          },
+          required: ["id", "name", "kind", "touches"],
         },
-        required: ["flows", "predictions"],
       },
-    });
+      predictions: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            flowId: { type: Type.STRING },
+            risk: {
+              type: Type.STRING,
+              enum: ["low", "medium", "high"],
+            },
+            hypothesis: { type: Type.STRING },
+            cites: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  file: { type: Type.STRING },
+                  lines: { type: Type.STRING },
+                },
+                required: ["file"],
+              },
+            },
+            howToVerify: { type: Type.STRING },
+          },
+          required: [
+            "id",
+            "flowId",
+            "risk",
+            "hypothesis",
+            "cites",
+            "howToVerify",
+          ],
+        },
+      },
+    },
+    required: ["flows", "predictions"],
+  };
+
+  return withRetryOnce(async () => {
+    const systemInstruction = `${UNTRUSTED_SYSTEM_PREAMBLE}\nReturn strictly valid JSON with only the requested fields.`;
+    let interaction;
+    try {
+      interaction = await ai.interactions.create({
+        model: modelId,
+        system_instruction: systemInstruction,
+        input: prompt,
+        response_format: responseFormat,
+      });
+    } catch (err) {
+      if (!isBadRequestError(err)) throw err;
+      // Some models/API versions reject nested response_format schemas with 400;
+      // fall back to strict prompt + Zod validation against RawAnalysisResponseSchema.
+      interaction = await ai.interactions.create({
+        model: modelId,
+        system_instruction: systemInstruction,
+        input: prompt,
+      });
+    }
 
     const text = collectInteractionText(interaction);
     const rawParsed = RawAnalysisResponseSchema.parse(extractJsonFromText(text));
