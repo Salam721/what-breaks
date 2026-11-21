@@ -1,1 +1,0 @@
-https://github.com/tastejs/todomvc/pull/2257

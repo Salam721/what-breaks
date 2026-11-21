@@ -1,6 +1,0 @@
-{
-  "name": "What Breaks If I Ship This?",
-  "description": "Takes a real public GitHub PR, predicts which user flows it breaks, and proves each prediction by running the app with parallel Gemini Managed Agents and Decisions API evidence judging.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
